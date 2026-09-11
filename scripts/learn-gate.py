@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Stop hook: 学習ループを自動で回すためのゲート。
+"""Stop hook: 学習ループを自動で回すためのゲート(Claude Code / Codex / Cursor 共通)。
 
-Claude Code がセッションを終えようとしたときに呼ばれ、次のどちらかなら終了を止めて
-「学習ループ(AGENTS.md)を実行してからコミット・プッシュせよ」と Claude に返す。
+エージェントがセッションを終えようとしたときに呼ばれ、次のどちらかなら終了を止めて
+「学習ループ(AGENTS.md)を実行してからコミット・プッシュせよ」と返す。
 
   1. この会話のユーザー発言に、差し戻し・書き換え・新しい決定のシグナルがあるのに、
      記憶ファイル(*.md)がこのセッション中に1つも変更されていない
   2. 記憶ファイルに未コミットの変更、または未プッシュのコミットがある
 
-止めるのは1セッションにつき1回だけ(stop_hook_active=True のときは何もしない)。
-依存は Python 3 標準ライブラリと git のみ。
+止めるのは1セッションにつき1回だけ。依存は Python 3 標準ライブラリと git のみ。
+
+呼び出し元の判別と入出力:
+  - Claude Code / Codex: stdin に stop_hook_active / transcript_path。
+      出力 {"decision": "block", "reason": "..."}
+  - Cursor: stdin に loop_count / transcript_path(hook_event_name は小文字 "stop")。
+      出力 {"followup_message": "..."}
+トランスクリプトの形式が読めないエージェントでも、git の未コミット・未プッシュ検知は動く。
 """
 import json
 import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
 
 # 差し戻し・書き換え・「前も言った」・新しい決定のシグナル。必要に応じて追加する。
 SIGNALS = [
@@ -30,11 +35,12 @@ SIGNALS = [
     r"今後は", r"これからは", r"決めた", r"決定", r"にする$", r"にします", r"覚えて", r"覚えといて",
     r"学習し", r"記録し", r"メモし", r"ルールに",
     # 英語
-    r"\bI (already )?told you\b", r"\bas I said\b", r"\bnot that\b", r"\bwrong\b", r"\bremember (this|that)\b",
+    r"\bI (?:already )?told you\b", r"\bas I said\b", r"\bnot that\b", r"\bwrong\b", r"\bremember (?:this|that)\b",
     r"\bdon'?t do that\b", r"\bfrom now on\b", r"\bstop doing\b",
 ]
 SIGNAL_RE = re.compile("|".join(SIGNALS), re.IGNORECASE | re.MULTILINE)
 MAX_QUOTES = 5
+NOISE = ("<command-name>", "<system-reminder>", "<local-command", "<task-notification", "<ci-monitor-event")
 
 
 def run(cmd, cwd):
@@ -44,12 +50,49 @@ def run(cmd, cwd):
         return ""
 
 
+def detect_agent(payload):
+    if "loop_count" in payload or str(payload.get("hook_event_name", "")) == "stop":
+        return "cursor"
+    return "claude"  # Codex は Claude と同じプロトコル
+
+
+def already_continued(payload, agent):
+    if agent == "cursor":
+        try:
+            return int(payload.get("loop_count") or 0) >= 1
+        except (TypeError, ValueError):
+            return False
+    return bool(payload.get("stop_hook_active"))
+
+
+def repo_dir(payload):
+    for cand in (payload.get("cwd"), *(payload.get("workspace_roots") or [])):
+        if cand and os.path.isdir(cand):
+            return cand
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _texts_from_content(content):
+    if isinstance(content, str):
+        return [content]
+    out = []
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                out.append(c.get("text", ""))
+            elif isinstance(c, str):
+                out.append(c)
+    return out
+
+
 def user_texts(transcript_path):
-    """トランスクリプト(JSONL)から、ユーザーが実際に打った本文だけを取り出す。"""
+    """トランスクリプト(JSONL)から、ユーザーが実際に打った本文だけを取り出す。
+    Claude Code / Codex 形式({type:user, message:{content}})と、
+    {role:user, content} / {role:user, text} の汎用形式を受け付ける。読めなければ空。"""
     texts, first_ts = [], None
     try:
         f = open(transcript_path, encoding="utf-8")
-    except OSError:
+    except (OSError, TypeError):
         return texts, first_ts
     with f:
         for line in f:
@@ -57,22 +100,22 @@ def user_texts(transcript_path):
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            ts = d.get("timestamp")
+            if not isinstance(d, dict):
+                continue
+            ts = d.get("timestamp") or d.get("created_at") or d.get("ts")
             if ts and first_ts is None:
                 first_ts = ts
-            if d.get("type") != "user" or d.get("isMeta"):
+            if d.get("isMeta"):
                 continue
-            content = d.get("message", {}).get("content")
-            parts = []
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "text":
-                        parts.append(c.get("text", ""))
+            msg = d.get("message") if isinstance(d.get("message"), dict) else d
+            role = d.get("type") if d.get("type") in ("user", "assistant") else msg.get("role")
+            if role != "user":
+                continue
+            parts = _texts_from_content(msg.get("content"))
+            if not parts and isinstance(msg.get("text"), str):
+                parts = [msg["text"]]
             for p in parts:
-                # スラッシュコマンド展開・システム注入・ツール結果は対象外
-                if "<command-name>" in p or "<system-reminder>" in p or "<local-command" in p:
+                if any(n in p for n in NOISE):
                     continue
                 p = p.strip()
                 if p:
@@ -87,7 +130,7 @@ def memory_files_changed(repo, since_iso):
         path = line[3:].strip()
         if path.endswith(".md"):
             changed.add(path)
-    if since_iso:
+    if since_iso and isinstance(since_iso, str):
         out = run(["git", "log", f"--since={since_iso}", "--name-only", "--pretty=format:"], repo)
         for path in out.splitlines():
             if path.strip().endswith(".md"):
@@ -109,18 +152,18 @@ def main():
         payload = json.load(sys.stdin)
     except Exception:
         payload = {}
-    if payload.get("stop_hook_active"):
+    if not isinstance(payload, dict):
+        payload = {}
+    agent = detect_agent(payload)
+    if already_continued(payload, agent):
         return 0  # すでに一度止めた。二度は止めない
 
-    repo = payload.get("cwd") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = repo_dir(payload)
     if not run(["git", "rev-parse", "--is-inside-work-tree"], repo).strip():
         return 0
 
-    texts, first_ts = user_texts(payload.get("transcript_path", ""))
-    hits = []
-    for t in texts:
-        if SIGNAL_RE.search(t):
-            hits.append(t.replace("\n", " ")[:80])
+    texts, first_ts = user_texts(payload.get("transcript_path"))
+    hits = [t.replace("\n", " ")[:80] for t in texts if SIGNAL_RE.search(t)]
     changed = memory_files_changed(repo, first_ts)
     dirty = uncommitted(repo)
     ahead = unpushed(repo)
@@ -143,7 +186,11 @@ def main():
 
     if not reasons:
         return 0
-    print(json.dumps({"decision": "block", "reason": "\n\n".join(reasons)}, ensure_ascii=False))
+    reason = "\n\n".join(reasons)
+    if agent == "cursor":
+        print(json.dumps({"followup_message": reason}, ensure_ascii=False))
+    else:
+        print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
     return 0
 
 

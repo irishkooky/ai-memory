@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "bash scripts/session-start.sh", "timeout": 20 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python3 scripts/learn-gate.py", "statusMessage": "記憶の更新漏れを確認中", "timeout": 30 } ] }
+    ]
+  }
+}

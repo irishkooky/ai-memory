@@ -25,5 +25,5 @@ cat <<MSG
 初期化しました。次にやること:
   1. profile.md を3〜10行埋める(会社概要・今やっていること)
   2. git remote add origin <URL> && git push -u origin main
-  3. Claude Code でこのディレクトリを開く(hooks の有効化を聞かれたら許可)
+  3. Claude Code / Codex / Cursor でこのディレクトリを開く(hooks の有効化を聞かれたら許可)
 MSG

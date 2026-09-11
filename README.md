@@ -28,8 +28,8 @@ flowchart LR
 | 部品 | 役割 | 場所 |
 |---|---|---|
 | **記憶** | 事実・決定・直しのルールを Markdown で持つ。Git なので履歴が残り、端末と人をまたいで同期される | `profile.md` `current.md` `decisions.md` `feedback.md` `people/` `projects/` |
-| **読み込み順と学習ループの定義** | AIに「何をどの順で読むか」「直されたら何をどこに書くか」を指示する | `AGENTS.md`(`CLAUDE.md` はそのシンボリックリンク) |
-| **自動学習ゲート** | セッション終了時に会話を走査し、差し戻し・書き換え・「前も言った」・新しい決定の発言を見つけたら、**記憶への追記とコミット・プッシュが終わるまで終了させない** | `scripts/learn-gate.py`(Claude Code の Stop hook) |
+| **読み込み順と学習ループの定義** | AIに「何をどの順で読むか」「直されたら何をどこに書くか」を指示する | `AGENTS.md`(`CLAUDE.md` はそのシンボリックリンク。Codex / Cursor は `AGENTS.md` を直接読む) |
+| **自動学習ゲート** | セッション終了時に会話を走査し、差し戻し・書き換え・「前も言った」・新しい決定の発言を見つけたら、**記憶への追記とコミット・プッシュが終わるまで終了させない** | `scripts/learn-gate.py`(Claude Code / Codex / Cursor の Stop hook から共通で呼ぶ) |
 
 「学習して」と言わなくても学習が回るのは、3つ目の部品があるからです。人は「覚えておいて」とは言いません。直すだけです。だから、直された痕跡を機械的に拾って、AI側に学習を強制します。
 
@@ -44,7 +44,7 @@ flowchart LR
 
    所有者名を聞かれるので入力。`git init`・`CLAUDE.md` のリンク・最終更新日の記入・初回コミットまでやります
 3. `profile.md` を埋める。**完璧な資料は不要**。会社概要と今やっていることを3〜10行書けば動きます
-4. Claude Code でこのディレクトリを開く。初回に `.claude/settings.json` の hooks を有効にするか聞かれるので許可する
+4. Claude Code / Codex / Cursor のどれかでこのディレクトリを開く。初回に hooks を有効にするか聞かれるので許可する(Codex は `~/.codex/config.toml` に `[features] hooks = true` が必要)
 5. 普通に仕事を頼む。直す。終わる。——終了時に AI が「feedback.md に〇〇のルールを追記してプッシュしました」と報告してきたら、仕組みが回っています
 
 ## 実際の流れ(例)
@@ -69,11 +69,26 @@ flowchart LR
 | `feedback.md` | 差し戻しから抽出した一般ルール。文面を作る前にAIが読む | 直されるたび |
 | `people/` | 相手・取引先ごとに1ファイル | 随時 |
 | `projects/` | 案件ごとに1ファイル | 随時 |
-| `.claude/settings.json` | hooks の定義(SessionStart / Stop) | — |
-| `.claude/skills/learn/` | 「学習しといて」と言われたときの手順 | — |
-| `scripts/learn-gate.py` | Stop hook 本体。差し戻し検知・未コミット検知 | — |
+| `.agents/skills/learn/` | 「学習しといて」と言われたときの手順(スキルの正本) | — |
+| `.claude/` | Claude Code 用の配線。`settings.json` に hooks、`skills` は `.agents/skills` へのシンボリックリンク | — |
+| `.codex/hooks.json` | Codex 用の配線(hooks) | — |
+| `.cursor/hooks.json` | Cursor 用の配線(hooks) | — |
+| `scripts/learn-gate.py` | Stop hook 本体。差し戻し検知・未コミット検知。3エージェント共通 | — |
 | `scripts/session-start.sh` | セッション冒頭に記憶の鮮度と直近の変更を表示 | — |
 | `docs/how-it-works.md` | hook の動作の詳細・カスタマイズ・テスト方法 | — |
+
+## 対応エージェント
+
+正本は `AGENTS.md`(指示)と `.agents/skills/`(スキル)と `scripts/`(hook 本体)の3つだけ。エージェントごとのディレクトリには配線しか置かないので、別のエージェントに乗り換えても記憶と学習ループはそのまま動きます。
+
+| | 指示の読み込み | スキル | 自動学習ゲート |
+|---|---|---|---|
+| **Claude Code** | `CLAUDE.md`(`AGENTS.md` へのシンボリックリンク) | `.claude/skills` → `.agents/skills` | `.claude/settings.json` の `Stop` hook |
+| **Codex** | `AGENTS.md` を直接読む | `.agents/skills` を直接読む | `.codex/hooks.json` の `Stop` hook(形式は Claude と同じ) |
+| **Cursor** | `AGENTS.md` を直接読む | `.agents/skills` を直接読む | `.cursor/hooks.json` の `stop` hook(`followup_message` で続行させる。既定で5回まで) |
+| **ChatGPT / Gemini(チャット)** | 最初に `AGENTS.md` を読ませる | — | なし。直しは手で `feedback.md` に書く |
+
+`scripts/learn-gate.py` は渡された JSON の形で呼び出し元を判別し、Claude / Codex には `decision: block`、Cursor には `followup_message` を返します。Codex の hooks は実験的機能で Windows 非対応(2026-09 時点)。Windows で clone する場合は `git config core.symlinks true` を先に設定しないと `CLAUDE.md` と `.claude/skills` が実ファイルになります。
 
 ## Claude Code 以外で使う
 

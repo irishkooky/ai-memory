@@ -6,24 +6,36 @@
 
 Claude Code の **Stop hook** はセッション終了の直前に必ず走り、`{"decision":"block","reason":"..."}` を返すと AI は終了できず、`reason` を読んで作業を続けます。ここに学習ループを差し込むと、人が何も言わなくても学習が回ります。
 
+## エージェント別の配線
+
+| | 指示 | スキル | Stop hook の設定 | 続行のさせ方 | 2回目を止めない判定 |
+|---|---|---|---|---|---|
+| Claude Code | `CLAUDE.md` → `AGENTS.md` | `.claude/skills` → `.agents/skills` | `.claude/settings.json` `hooks.Stop` | `{"decision":"block","reason":…}` | `stop_hook_active` |
+| Codex | `AGENTS.md` | `.agents/skills` | `.codex/hooks.json` `hooks.Stop`(Claude と同形式) | 同上 | `stop_hook_active` |
+| Cursor | `AGENTS.md` | `.agents/skills` | `.cursor/hooks.json` `hooks.stop` | `{"followup_message":…}`(次のユーザー発言として自動送信) | `loop_count >= 1` |
+
+正本は `AGENTS.md` `.agents/skills/` `scripts/` の3つ。エージェント固有ディレクトリは配線のみ。新しいエージェントを足すときは、そのエージェントの hook 設定から `python3 scripts/learn-gate.py` を呼び、`detect_agent` と出力の分岐を1箇所足せばよい。
+
 ## Stop hook(`scripts/learn-gate.py`)の動作
 
-入力(標準入力の JSON): `session_id` `transcript_path` `cwd` `stop_hook_active`
+入力(標準入力の JSON): `session_id` `transcript_path` `cwd` `stop_hook_active`(Cursor は `loop_count` `workspace_roots`)
 
-1. `stop_hook_active` が true なら何もしない(すでに一度止めた。2回目は止めない。無限ループ防止)
-2. `transcript_path` の JSONL を読み、**ユーザーが実際に打った本文だけ**を集める
-   - `type == "user"` かつ `isMeta` でないもの
+1. 呼び出し元を判別する。`loop_count` があるか `hook_event_name` が小文字の `stop` なら Cursor、それ以外は Claude / Codex
+2. `stop_hook_active` が true(Cursor は `loop_count` が1以上)なら何もしない(すでに一度止めた。2回目は止めない。無限ループ防止)
+3. `transcript_path` の JSONL を読み、**ユーザーが実際に打った本文だけ**を集める
+   - `type == "user"` かつ `isMeta` でないもの(`{role:"user", content}` の汎用形式も受け付ける)
    - `content` の `text` ブロックのみ(`tool_result` は除外)
    - スラッシュコマンド展開(`<command-name>`)・システム注入(`<system-reminder>`)は除外
-3. 本文を `SIGNALS` の正規表現で走査する。差し戻し(「違う」「じゃなくて」「直して」)、「前も言った」系、新しい決定(「今後は」「決めた」)、記憶指示(「覚えて」「学習し」)
-4. `git status` と `git log --since=<セッション最初のタイムスタンプ>` で、**このセッション中に変更された .md** を集める
-5. 判定
+   - 形式が読めないエージェントでは本文が空になり、次の未コミット・未プッシュ検知だけが効く
+4. 本文を `SIGNALS` の正規表現で走査する。差し戻し(「違う」「じゃなくて」「直して」)、「前も言った」系、新しい決定(「今後は」「決めた」)、記憶指示(「覚えて」「学習し」)
+5. `git status` と `git log --since=<セッション最初のタイムスタンプ>` で、**このセッション中に変更された .md** を集める
+6. 判定
    - シグナルあり **かつ** 記憶の変更なし → block。検知した発言を最大5件引用して「学習ループを実行せよ」
    - 未コミットの変更あり → block。「コミット・プッシュせよ」
    - 未プッシュのコミットあり → block。「push せよ」
    - それ以外 → 何も出さず終了(exit 0)
 
-出力は標準出力に JSON 1行。exit code は常に 0(exit 2 だと stderr がそのまま AI に渡る別モードになるので使わない)。
+出力は標準出力に JSON 1行(Claude / Codex は `decision` + `reason`、Cursor は `followup_message`)。exit code は常に 0(exit 2 だと stderr がそのまま AI に渡る別モードになるので使わない)。
 
 ## SessionStart hook(`scripts/session-start.sh`)
 
@@ -55,6 +67,8 @@ echo "{\"cwd\":\"$tmp\",\"transcript_path\":\"$tmp/t.jsonl\",\"stop_hook_active\
 
 ## 制約・注意
 
-- hooks はプロジェクトの `.claude/settings.json` に入っているので、clone した人全員に効きます。初回起動時に Claude Code が有効化の確認を出します
+- hooks はプロジェクト内の設定(`.claude/settings.json` `.codex/hooks.json` `.cursor/hooks.json`)に入っているので、clone した人全員に効きます。初回起動時に各エージェントが有効化の確認を出します。Codex は `~/.codex/config.toml` の `[features] hooks = true` が前提で、2026-09 時点では実験的機能・Windows 非対応
+- Cursor の `stop` hook は既定で自動続行5回までの上限があり(`loop_limit`)、このスクリプトは `loop_count` が1以上なら止めないので上限には達しません
+- `CLAUDE.md` と `.claude/skills` はシンボリックリンクです。Windows で clone するときは `git config core.symlinks true` を先に設定してください
 - トランスクリプトの最初のタイムスタンプを「セッション開始」とみなします。コンパクション後の再開セッションでは古い時刻になることがあり、その場合は学習の催促が出にくくなります(未コミット検知は影響を受けません)
 - Windows は `session-start.sh` の `date -j` / `date -d` 判定が効かない場合があります。Git Bash なら `date -d` で動きます
